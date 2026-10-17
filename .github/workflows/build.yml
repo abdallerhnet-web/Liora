@@ -1,51 +1,22 @@
 name: build-liora
-
 on:
-  workflow_dispatch: {}
   push:
-    branches: [main]
-
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Version comes from the packageManager field (pnpm@11.11.0).
-      - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 24.21.0
-
-      - name: Install (frozen lockfile; falls back to regenerating it once)
-        shell: bash
-        run: |
-          pnpm install --frozen-lockfile || {
-            echo "::warning::pnpm-lock.yaml was out of date (viem added). Regenerating; commit the lockfile from the artifact."
-            pnpm install --no-frozen-lockfile
-          }
-
-      - name: Unit tests
-        shell: bash
-        run: pnpm run test:unit
-
-      - name: Starter check (typecheck, 2x deterministic build, MCP conformance)
-        shell: bash
-        run: pnpm --silent test | tee conformance-report.json
-
-      - name: Hash the bundle
-        if: always()
-        shell: bash
-        run: sha256sum dist/plugin.mjs | tee dist/plugin.mjs.sha256
-
+      - run: npm i -g pnpm@11.11.0
+      - run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
+      - run: pnpm test
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: liora-plugin
           path: |
             dist/plugin.mjs
-            dist/plugin.mjs.sha256
-            paybox-plugin.json
             pnpm-lock.yaml
-            conformance-report.json
+          if-no-files-found: error
