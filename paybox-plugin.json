@@ -1,0 +1,9 @@
+{
+  "tool": "create_agreement",
+  "arguments": {
+    "payee": "0x1111111111111111111111111111111111111111",
+    "amount": "1.25",
+    "description": "Liora sample agreement",
+    "reference": "INV-0001"
+  }
+}
