@@ -1,11 +1,12 @@
 // LIVE check: talks to the real Base network through the real public RPC.
-// It finds a recent real USDC Transfer on Base, then proves verify_settlement
-// gives the right verdict for it (and the right *wrong* verdicts for near-misses).
-// Run: pnpm run test:live   (needs internet; skipped from the offline unit tests)
+// It finds a recent real USDC transfer() call on Base (recipient and amount read from the
+// transaction's own calldata, i.e. a source independent of the receipt logs), then proves
+// verify_settlement gives the right verdict for it and the right *wrong* verdicts for near-misses.
+// Run: pnpm run test:live   (needs internet; not part of the offline unit tests)
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { test } from "node:test";
-import { createPublicClient, decodeFunctionData, erc20Abi, http, parseAbiItem } from "viem";
+import { createPublicClient, decodeFunctionData, erc20Abi, http } from "viem";
 import { base } from "viem/chains";
 import {
   BASE_RPC_URL,
@@ -21,6 +22,13 @@ import {
 
 type Check = { name: string; ok: boolean; detail: string };
 
+function message(error: unknown): string {
+  if (!(error instanceof Error)) return String(error).slice(0, 400);
+  const e = error as Error & { shortMessage?: string; details?: string };
+  const text = [e.shortMessage ?? e.message, e.details].filter(Boolean).join(" | ");
+  return text.replace(/Request body:.*$/s, "").slice(0, 400);
+}
+
 async function retry<T>(label: string, fn: () => Promise<T>, tries = 4): Promise<T> {
   let last: unknown;
   for (let i = 0; i < tries; i += 1) {
@@ -31,7 +39,7 @@ async function retry<T>(label: string, fn: () => Promise<T>, tries = 4): Promise
       await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)));
     }
   }
-  throw new Error(`${label} failed after ${tries} tries: ${last instanceof Error ? last.message : String(last)}`);
+  throw new Error(`${label} failed after ${tries} tries: ${message(last)}`);
 }
 
 // The production reader never retries (10s budget). The test retries only so a shared
@@ -44,12 +52,10 @@ function retrying(reader: ChainReader): ChainReader {
   };
 }
 
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 300);
-
 test("live Base: verify_settlement and proposal against a real USDC transfer", { timeout: 240_000 }, async () => {
   const checks: Check[] = [];
   const failures: string[] = [];
-  let tx: { hash: string; block: string; from: string; to: string; value: string; logIndex: number } | undefined;
+  let tx: { hash: string; block: string; from: string; to: string; value: string } | undefined;
 
   const check = async (name: string, fn: () => Promise<string | void>) => {
     try {
@@ -64,35 +70,34 @@ test("live Base: verify_settlement and proposal against a real USDC transfer", {
   try {
     const client = createPublicClient({ chain: base, transport: http(BASE_RPC_URL, { timeout: 8_000, retryCount: 0 }) });
     const latest = await retry("latest block", () => client.getBlockNumber());
-    const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
+    checks.push({ name: "RPC reachable, latest block read", ok: true, detail: `block ${latest}` });
 
-    let picked;
-    for (const window of [20n, 200n]) {
-      const logs = await retry("getLogs", () =>
-        client.getLogs({ address: USDC_BASE, event: transferEvent, fromBlock: latest - window - 12n, toBlock: latest - 12n }),
-      );
-      picked = logs.find(
-        (l) =>
-          l.args.from !== undefined &&
-          l.args.to !== undefined &&
-          l.args.value !== undefined &&
-          l.args.value >= 1000n &&
-          l.args.value + 1n <= MAX_ATOMIC &&
-          l.args.from.toLowerCase() !== l.args.to.toLowerCase() &&
-          l.transactionHash !== null &&
-          l.logIndex !== null &&
-          l.blockNumber !== null,
-      );
-      if (picked) break;
+    // Scan recent blocks for a successful direct USDC transfer(to, value) call.
+    let found: { hash: `0x${string}`; block: bigint; from: string; to: string; value: bigint } | undefined;
+    for (let n = latest - 12n; n > latest - 60n && found === undefined; n -= 1n) {
+      const block = await retry(`getBlock ${n}`, () => client.getBlock({ blockNumber: n, includeTransactions: true }));
+      for (const t of block.transactions) {
+        if (t.to?.toLowerCase() !== USDC_BASE || !t.input.startsWith("0xa9059cbb")) continue;
+        let args: readonly [string, bigint];
+        try {
+          const decoded = decodeFunctionData({ abi: erc20Abi, data: t.input });
+          if (decoded.functionName !== "transfer") continue;
+          args = [decoded.args[0] as string, decoded.args[1] as bigint];
+        } catch {
+          continue;
+        }
+        const [to, value] = args;
+        if (value < 1000n || value + 1n > MAX_ATOMIC || to.toLowerCase() === t.from.toLowerCase()) continue;
+        const receipt = await retry("receipt", () => client.getTransactionReceipt({ hash: t.hash }));
+        if (receipt.status !== "success") continue;
+        found = { hash: t.hash, block: n, from: t.from, to, value };
+        break;
+      }
     }
-    assert.ok(picked, "no usable recent USDC Transfer found on Base");
-    const from = picked.args.from as string;
-    const to = picked.args.to as string;
-    const value = picked.args.value as bigint;
-    const hash = picked.transactionHash as `0x${string}`;
-    const logIndex = picked.logIndex as number;
-    tx = { hash, block: String(picked.blockNumber), from, to, value: value.toString(), logIndex };
-    checks.push({ name: "found a real recent USDC transfer", ok: true, detail: `${hash} block ${tx.block} value ${tx.value} atomic` });
+    assert.ok(found, "no successful direct USDC transfer() found in the last ~60 Base blocks");
+    const { hash, from, to, value } = found;
+    tx = { hash, block: String(found.block), from, to, value: value.toString() };
+    checks.push({ name: "found a real recent USDC transfer() call", ok: true, detail: `${hash} block ${tx.block} value ${tx.value} atomic` });
 
     const reader = retrying(createBaseReader());
     const exact = { txHash: hash, recipient: to, amount: formatUsdc(value) };
@@ -101,8 +106,8 @@ test("live Base: verify_settlement and proposal against a real USDC transfer", {
       const r = await verifySettlement(exact, reader);
       assert.equal(r.verdict, "verified", r.summary);
       assert.ok(
-        r.transfersToRecipient.some((t) => t.logIndex === logIndex && t.atomicAmount === value.toString()),
-        "real transfer log not listed",
+        r.transfersToRecipient.some((t) => t.atomicAmount === value.toString()),
+        "real transfer not listed in transfersToRecipient",
       );
       return `confirmations=${r.confirmations} matchedLogIndex=${r.matchedLogIndex}`;
     });
