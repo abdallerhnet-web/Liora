@@ -12,6 +12,8 @@ jobs:
           node-version: 24.21.0
       - run: npm i -g pnpm@11.11.0
       - run: pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
+      - name: Unit tests (offline)
+        run: pnpm run test:unit
       - run: pnpm test
       - uses: actions/upload-artifact@v4
         with:
@@ -20,3 +22,16 @@ jobs:
             dist/plugin.mjs
             pnpm-lock.yaml
           if-no-files-found: error
+      - name: Live Base check (real RPC, real USDC transfer)
+        env:
+          LIVE_REPORT_PATH: live-report.json
+        run: pnpm run test:live
+      - name: Show live results
+        if: always()
+        run: node scripts/live-annotate.mjs live-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: liora-live-report
+          path: live-report.json
+          if-no-files-found: warn

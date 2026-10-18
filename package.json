@@ -14,6 +14,7 @@
     "conformance": "node scripts/conformance.mjs",
     "test": "node scripts/test.mjs",
     "test:unit": "tsx --test tests/*.test.ts",
+    "test:live": "tsx --test tests/live/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
